@@ -2,7 +2,7 @@ package tests
 
 import (
 	"fmt"
-	"strings"
+	"strconv"
 	"testing"
 	"time"
 
@@ -21,16 +21,35 @@ func checkTest(t *testing.T) {
 }
 
 func verify(c *CheckContext, bridge string, expected []int) error {
-	for i, e := range expected {
-		actions := fmt.Sprintf(`resubmit(;%d)`, i+1)
-		gremlin := c.gremlin.V().Has("Type", "ovsbridge", "Name", bridge).Out("Type", "ofrule").Has("actions", actions)
-		nodes, err := c.gh.GetNodes(gremlin)
-		if err != nil {
-			return err
+	l := len(expected)
+	found := make([]int, l)
+	gremlin := c.gremlin.V().Has("Type", "ovsbridge", "Name", bridge).Out("Type", "ofrule")
+	nodes, _ := c.gh.GetNodes(gremlin)
+	for _, node := range nodes {
+		metadata := node.Metadata
+		actions := metadata["actions"].([]interface{})
+		if len(actions) != 1 {
+			continue
 		}
-		l := len(nodes)
-		if l != e {
-			return fmt.Errorf("expected %d rules with '%s' but got %d - %v", e, actions, l, nodes)
+		action := actions[0].(map[string]interface{})
+		f := action["f"].(string)
+		if f != "resubmit" {
+			continue
+		}
+		args := action["a"].([]interface{})
+		if len(args) != 2 {
+			continue
+		}
+		arg := args[1].(map[string]interface{})
+		target, err := strconv.Atoi(arg["f"].(string))
+		if err == nil && target <= l {
+			found[target-1] = found[target-1] + 1
+		}
+	}
+	for i, e := range expected {
+		f := found[i]
+		if f != e {
+			return fmt.Errorf("expected %d rules with '%d' but got %d - %v", e, i, f, nodes)
 		}
 	}
 	return nil
@@ -162,7 +181,21 @@ func verifyGroup(c *CheckContext, bridge string, expected int) error {
 			if m["group_type"].(string) != "all" {
 				return fmt.Errorf("Group type set to %s", m["group_type"])
 			}
-			if !strings.Contains(m["contents"].(string), "resubmit(,1)") {
+			buckets := m["buckets"].([]interface{})
+			found := false
+		loop:
+			for _, rawbucket := range buckets {
+				bucket := rawbucket.(map[string]interface{})
+				actions := bucket["actions"].([]interface{})
+				for _, rawaction := range actions {
+					action := rawaction.(map[string]interface{})
+					if action["f"] == "resubmit" {
+						found = true
+						break loop
+					}
+				}
+			}
+			if !found {
 				return fmt.Errorf("Problem with contents: %s", m["contents"])
 			}
 		}

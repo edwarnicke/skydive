@@ -37,10 +37,7 @@ var CONTROLLER_PORT = -3;
 var OTHER_PORTS = -4;
 /** Port number representing the entry port - not an Openflow normalized port */
 var SAME_PORT = -5;
-var reFindInport = new RegExp('(^|.*,)in_port=([0-9]*)(,.*|$)');
-var reFindPriority = new RegExp('^priority=([0-9]*),?(.*|$)');
-var reBucket = new RegExp('^bucket_id:([0-9]*),?(.*$)');
-var reSplit = new RegExp('[:();]');
+
 /** Translation from OVS syntax to summary actions */
 var actionTable = {
   'output': ActionOutput,
@@ -69,23 +66,25 @@ function safePort(s) {
  * @param element the element of the
  */
 function computeAction(rule, element) {
-  element = element.toLowerCase();
-  var atoms = element.split(reSplit);
-  var verb = atoms[0];
+  var verb = element['f'].toLowerCase();
+  var args = element['a'];
+  function getNumArg(i) {
+    return safePort(args[i]?args[i]['f']:'');
+  }
   var action = actionTable[verb];
   if (action !== undefined) {
     var summary = { action: action };
     switch (verb) {
       case 'resubmit':
-        summary.port = safePort(atoms[1]);
+        summary.port = getNumArg(0);
         if (summary.port === ANY_PORT)
           summary.port = SAME_PORT;
-        if (atoms.length > 2)
-          summary.table = safePort(atoms[2]);
+        if (args.length > 1)
+          summary.table = getNumArg(1);
         break;
       case 'output':
       case 'enqueue':
-        summary.port = safePort(atoms[1]);
+        summary.port = getNumArg(0);
         break;
       case 'local':
         summary.port = LOCAL_PORT;
@@ -98,11 +97,11 @@ function computeAction(rule, element) {
   }
 }
 /** Summarize the actions of a rule, filling the outAction field
- *  @param rule: the rule to complete
+ *  @param rule: the rule to summarize.
  */
 function summarizeActions(rule) {
   rule.outAction = [];
-  var actions = rule.actions.split(',');
+  var actions = rule.actions;
   for (var i = 0; i < actions.length; i++) {
     computeAction(rule, actions[i]);
   }
@@ -113,20 +112,17 @@ function summarizeActions(rule) {
  * @return the port or ANY_PORT if not found.
 */
 function inport(filters) {
-  var matchInport = reFindInport.exec(filters);
-  return matchInport ? safePort(matchInport[2]) : ANY_PORT;
-}
-
-/** Get rid of the priority part in the filter
- * @param filters: the filters of a rule as a string usually beginning with priority
- * @return the simplified filter as a string.
- */
-function removePriority(filters) {
-  var matchPriority = reFindPriority.exec(filters);
-  if (matchPriority) {
-    return matchPriority[2];
+  var matchInport = ANY_PORT;
+  if (filters) {
+    for (var i=0; i <  filters.length; i++) {
+      var filter = filters[i];
+      if (filter['k'] == 'in_port') {
+        matchInport = safePort(filter['v']);
+        break;
+      }
+    }
   }
-  return filters;
+  return matchInport;
 }
 
 /** Summarize the filter of a rule, filling the inPort
@@ -134,7 +130,50 @@ function removePriority(filters) {
  */
 function summarizeFilter(rule) {
   rule.inPort = inport(rule.filters);
-  rule.filters = removePriority(rule.filters);
+}
+
+/** Text from a list of Openflow filters
+ * @param filters: list of Openflow filter in JSON syntax
+ * @return a single string, empty if no filter.
+ */
+function textFilters(filters) {
+  function text(e) {
+    var r = e['v'] != '' ? ':' + e['v'] + (e['m'] != undefined ? '/' + e['m']: '')  : '';
+    return e['k'] + r
+  }
+  return !filters ? '' : filters.map(text).join(',');
+}
+
+/** Pretty print an action
+ *
+ * @param a: the json action to pretty print
+ * @return a string in the spirit of OVS syntax but with less quirks.
+ */
+function textAction(a) {
+  if (!a) return ''
+  var args = a['a'];
+  var f = a['f'];
+  var r;
+  switch(f) {
+    case '=':
+      r = textAction(args[0]) + '=' + textAction(args[1]);
+      break;
+    case 'range':
+      r = (
+        textAction(args[0]) + '[' +
+        (args.length > 1
+          ? textAction(args[1]) +
+            (args.length == 3 ? '..' +  textAction(args[2]) + ']' : ']')
+          : ']'));
+      break;
+    default:
+      if (args != undefined) {
+        r = f + '(' + args.map(textAction).join(',') + ')';
+      } else {
+        r = f;
+      }
+  }
+  return a['k'] ? a['k'] + '=' + r : r;
 }
 
 /** Computes the summary of a rule, both filters and outActions
@@ -143,14 +182,8 @@ function summarizeFilter(rule) {
 function summarize(rule) {
   summarizeFilter(rule);
   summarizeActions(rule);
-}
-
-function parseBucket(input) {
-  var matched = reBucket.exec(input);
-  if (matched) {
-    return {id: matched[1], content: matched[2]};
-  }
-  return null;
+  rule['textFilters'] = textFilters(rule['filters']);
+  rule['textActions'] = rule['actions'].map(textAction).join(',');
 }
 
 /** Computes the summary of a group node.
@@ -159,16 +192,21 @@ function parseBucket(input) {
  * as the selection algorithm (assumed before the first bucket)
  */
 function summarizeGroup(group) {
-  var rawBuckets = group.contents.split('bucket=')
-  for(var i=0; i < rawBuckets.length; i++) {
-    var b = rawBuckets[i];
-    if (b.charAt(b.length - 1) == ',') {
-      rawBuckets[i] = b.slice(0, -1);
-    }
-
-    group.additional = rawBuckets[0];
-    group.buckets = rawBuckets.slice(1).map(parseBucket);
+  function textMeta(m){
+    return m['k'] + (m['v'] ? '=' + m['v'] : '');
   }
+  function textBucket(bucket) {
+    var content;
+    var actions = bucket.actions.map(textAction).join(',');
+    if (bucket.meta) {
+      content = bucket.meta.map(textMeta).join(',') + ',actions='  + actions;
+    } else {
+      content = 'actions=' + actions;
+    }
+    return {id: bucket.id, content: content};
+  }
+  group.metaText = group.meta ? group.meta.map(textMeta).join(',') : '';
+  group.bucketsText = group.buckets.map(textBucket);
 }
 
 /** Compare two openflow rules by priority and then action.
@@ -469,7 +507,7 @@ Vue.component('rule-table-detail', {
                   {{rule.priority}}\
                 </td>\
                 <td>\
-                  {{ splitLine(rule.filters) }}\
+                  {{ splitLine(rule.textFilters) }}\
                 </td>\
                 <td v-if="rule.actionsSpan != -1" :rowspan="rule.actionsSpan">\
                     <table class="inner-table">\
@@ -487,7 +525,7 @@ Vue.component('rule-table-detail', {
                     </table>\
                 </td>\
                 <td v-if="rule.actionsSpan != -1" :rowspan="rule.actionsSpan">\
-                  {{ splitLine(rule.actions) }}\
+                  {{ splitLine(rule.textActions) }}\
                 </td>\
             </tr>\
         </tbody>\
@@ -547,7 +585,7 @@ Vue.component('groups-detail', {
                   </div>\
                   <div class="object-key-value">\
                     <span class="object-key">Additional</span>: \
-                    <span class="object-detail">{{group.additional}}</span>\
+                    <span class="object-detail">{{group.metaText}}</span>\
                   </div>\
                 </div>\
                 <div class="dynamic-table">\
@@ -559,7 +597,7 @@ Vue.component('groups-detail', {
                           </tr>\
                       </thead>\
                       <tbody>\
-                          <tr v-for="bucket in group.buckets"\
+                          <tr v-for="bucket in group.bucketsText"\
                               :id="\'GB-\' + group.UUID + \'-\' + bucket.id">\
                               <td>{{bucket.id}}</td>\
                               <td>{{bucket.content}}</td>\
